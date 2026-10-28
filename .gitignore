@@ -1,0 +1,10 @@
+# 个人隐私与运行产物，不进仓库
+config.json
+browser_profile/
+结果截图/
+__pycache__/
+*.pyc
+
+# 大体积数据文件：schools.json 首次运行自动联网生成；bank.json 可用 build_bank.py 从题库 docx 重新生成
+schools.json
+bank.json
