@@ -260,6 +260,18 @@ class Engine:
         page.wait_for_function("() => !!sessionStorage.getItem('token')", timeout=25000)
         page.wait_for_selector("button.schoolBtn", timeout=20000)
         self.log("页面加载完成（已获取访问令牌）")
+        # 学校名单是异步加载的，名单没到就点按钮会弹不出选择器
+        end = time.time() + 30
+        n = 0
+        while time.time() < end:
+            n = self._school_data_ready()
+            if n:
+                break
+            time.sleep(0.5)
+        if n:
+            self.log("学校名单已加载（%d 个城市）" % n)
+        else:
+            self.log("学校名单 30 秒内没加载完，继续尝试（弹窗会自动重试）", "dim")
 
     # ---------- 2. 填写个人信息 ----------
     def _tap_option(self, el):
@@ -305,13 +317,51 @@ class Engine:
                 return
         raise RuntimeError("选择弹窗关不掉，请重试")
 
+    def _school_data_ready(self):
+        try:
+            return self._vm("""() => {
+                let n = 0;
+                (function w(c, d) {
+                  if (!c || d > 6) return;
+                  if (c.$data && c.$data.pickerData) { n = (c.$data.pickerData[0].columns || []).length; return; }
+                  (c.$children || []).forEach(x => w(x, d + 1));
+                })(document.getElementById('app').__vue__, 0);
+                return n;
+            }""")
+        except Exception:
+            return 0
+
+    def _open_picker(self, btn_sel):
+        """点开滚轮弹窗；点不开就重试，避免网络慢时直接超时。"""
+        page = self.page
+        last = None
+        for attempt in range(3):
+            btn = page.query_selector(btn_sel)
+            if btn is None:
+                raise RuntimeError("页面上找不到按钮：%s" % btn_sel)
+            if attempt == 0:
+                self.human_click(btn)
+            else:
+                try:
+                    btn.click(timeout=3000)
+                except Exception:
+                    self.human_click(btn)
+            try:
+                page.wait_for_selector(".van-picker__columns", timeout=6000)
+                return
+            except Exception as e:
+                last = e
+                self.log("选择弹窗没出来，重试 %d/3" % (attempt + 1), "dim")
+                time.sleep(1.0)
+        raise RuntimeError("选择弹窗一直打不开（%s）。当前页面文字：%s" % (
+            last, page.inner_text("body")[:120].replace("\n", " ")))
+
     def _pick_one(self, btn_sel, text):
         page = self.page
         st = self._picker_state()
         if st and st.get("show"):
             self._confirm_picker()  # 上一个弹窗还开着，先关掉
-        self.human_click(page.query_selector(btn_sel))
-        page.wait_for_selector(".van-picker__columns", timeout=10000)
+        self._open_picker(btn_sel)
         # 弹窗可能还停在上一次的内容，等目标选项真正出现
         end = time.time() + 10
         target = None
@@ -335,8 +385,7 @@ class Engine:
 
     def _pick_school(self, city, school):
         page = self.page
-        self.human_click(page.query_selector("button.schoolBtn"))
-        page.wait_for_selector(".van-picker__columns", timeout=10000)
+        self._open_picker("button.schoolBtn")
         time.sleep(random.uniform(0.5, 0.9))
 
         def choose(col_index, text):
