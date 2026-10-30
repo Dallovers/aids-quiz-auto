@@ -227,6 +227,15 @@ class Engine:
 
             try:
                 self._open_entry()
+                # 已通过就别再浪费机会
+                data = ((self._query_result() or {}).get("result")) or {}
+                if str(data.get("ifPass")) == "1":
+                    self.log("这个身份已经通过考试（%s），无需重复作答。" % data.get("inputDate"), "ok")
+                    try:
+                        self._save_certificate()
+                    except Exception:
+                        pass
+                    return
                 self._fill_form()
                 started = self._enter_exam()
                 if started:
@@ -463,7 +472,9 @@ class Engine:
         page.wait_for_selector("button.answer", timeout=25000)
         info = self._paper()
         if not info:
-            raise RuntimeError("没读到试题数据")
+            self.log("没有拿到试题（可能已经考过），改为直接查成绩 …")
+            self._wait_result()
+            return False
         self.total = info["n"]
         self.answers = info["list"]
         self.log("试卷加载完成：共 %d 题，%s" % (self.total, info.get("title") or ""))
@@ -616,72 +627,74 @@ class Engine:
         self.human_click(page.query_selector(".operationView .nextBtn"))
         page.wait_for_selector(".van-dialog", timeout=15000)
         time.sleep(random.uniform(0.8, 1.4))
-        for attempt in range(3):
-            try:
-                page.click(".van-dialog__confirm", timeout=4000)
-            except Exception:
-                pass
-            self.log("已确认提交，等待服务端回执 …")
-            end = time.time() + 8
-            while time.time() < end and self.submit_resp is None and "examResult" not in page.url:
-                time.sleep(0.3)
-            if self.submit_resp is not None or "examResult" in page.url:
-                break
-            if page.query_selector(".van-dialog") is None:
-                break
-            self.log("提交没有生效，再点一次确认 …")
-        if self.submit_resp is None and "examResult" not in page.url:
-            self.log("没抓到服务端回执，可能网络慢或提交未生效", "bad")
+        # 只点一次：服务端其实会保存成绩，重复点只会制造重复提交
+        try:
+            page.click(".van-dialog__confirm", timeout=5000)
+        except Exception:
+            self.human_click(page.query_selector(".van-dialog__confirm"))
+        self.log("已确认提交，等待成绩回写 …")
+        time.sleep(2.0)
+
+    def _query_result(self):
+        """直接向成绩接口求证。saveExamInfo 经常返回 code=-1，但成绩其实已经写进去了。"""
+        try:
+            return self._vm("""async () => {
+                const tok = sessionStorage.getItem('token');
+                const oid = localStorage.getItem('openid');
+                const RT = Date.now().toString();
+                const buf = await crypto.subtle.digest('SHA-1',
+                    new TextEncoder().encode('openid=' + oid + '&RT=' + RT));
+                const sig = [...new Uint8Array(buf)].map(x => x.toString(16).padStart(2, '0')).join('');
+                const r = await fetch('https://www.jscdc.cn/aids/api/subject/getExamResult', {
+                    method: 'POST',
+                    headers: {'Content-Type': 'application/x-www-form-urlencoded'},
+                    body: new URLSearchParams({sig, token: tok, openid: oid, RT}).toString()
+                });
+                return await r.json();
+            }""")
+        except Exception as e:
+            self.log("查询成绩接口失败：%s" % e)
+            return None
 
     def _wait_result(self):
         page = self.page
         if self.submit_resp is not None and self.submit_resp.get("code") not in (0, "0"):
-            self.log("提交失败：服务端返回 %s（code=%s）" % (
-                self.submit_resp.get("message"), self.submit_resp.get("code")), "bad")
-            if self.project_closed:
-                self.log("原因就是上面那句：该校考卷还没开放。等学校通知开放后再跑一次即可，作答环节本身是正常的。", "dim")
-            else:
-                self.log("可能原因：已提交过 / 次数用尽 / 站点暂不收卷。可勾选显示浏览器，手动点一次提交试试。", "dim")
-            self._screenshot("提交失败")
-            return
-        self.log("等待成绩 …")
+            self.log("提交接口返回 %s（code=%s）。这个站点常常在成绩已保存后仍报错，继续向成绩接口求证 …" % (
+                self.submit_resp.get("message"), self.submit_resp.get("code")), "dim")
         try:
-            page.wait_for_url("**/examResult**", timeout=20000)
-        except Exception:
-            pass
-        if "examResult" not in page.url:
-            self.log("没有跳到成绩页，本次提交结果未知（答案已存档，可在浏览器里手动提交）", "bad")
-            self._screenshot("未确认")
-            return
-        time.sleep(random.uniform(1.5, 2.5))
-        txt = page.inner_text("body")
-        data = None
-        try:
-            raw = page.evaluate("() => sessionStorage.getItem('examResultData')")
-            if raw:
-                data = json.loads(raw)
+            page.wait_for_url("**/examResult**", timeout=12000)
         except Exception:
             pass
 
-        if data:
-            self.log("成绩：%s" % json.dumps(data, ensure_ascii=False)[:300])
-        if "顺利通过" in txt:
-            self.log("★ 结果：通过 ✅")
-        elif "未能通过" in txt:
-            self.log("★ 结果：未通过 ❌")
-        else:
-            self.log("★ 结果页文字：%s" % txt.replace("\n", " ")[:200])
+        passed = None
+        for _ in range(4):
+            res = self._query_result()
+            data = (res or {}).get("result") or {}
+            if data.get("name"):
+                self.log("成绩记录：%s / %s / %s / 日期 %s" % (
+                    data.get("name"), data.get("schoolName"), data.get("grade"), data.get("inputDate")))
+                if str(data.get("ifPass")) == "1":
+                    passed = True
+                elif str(data.get("ifPass")) == "2":
+                    passed = False
+                break
+            time.sleep(3.0)
 
-        path = self._screenshot("成绩")
-        if path:
-            self.log("成绩截图：%s" % path)
-
-        # 通过的顺手存证明
-        if "顺利通过" in txt:
+        if passed is True:
+            self.log("★ 结果：通过（服务端成绩接口已确认）", "ok")
+            path = self._screenshot("成绩")
+            if path:
+                self.log("成绩截图：%s" % path)
             try:
                 self._save_certificate()
             except Exception as e:
                 self.log("（证明截图未取到：%s）" % e)
+        elif passed is False:
+            self.log("★ 结果：未通过", "bad")
+            self._screenshot("成绩")
+        else:
+            self.log("没查到成绩记录，提交可能未生效（答案已存档）", "bad")
+            self._screenshot("未确认")
 
     def _save_certificate(self):
         page = self.page
